@@ -17,10 +17,9 @@
 //     4) 拉低 SCK
 //
 //  【握手关键】STM32 的判据是 g_rx == g_tx (期望原样回环)。
-//  8bit 的整字节回环在同一帧内是做不到的 (收到第 8 位时主机已经把 MISO 采完了),
-//  所以这里用的是"位回环": SCK 每个上升沿采到 MOSI 的那一位, 立刻用它驱动 MISO,
-//  主机在同一个 SCK 高电平期间读回的就是它刚刚发的那一位 ->
-//  8 位下来 RxData 与 TxData 完全相同, 握手成立。
+//  片选有效时 MISO 直接输出同步后的 MOSI, 因此在 SCK 上升沿之前就已经稳定,
+//  主机采样得到的就是当前发送位 -> 8 位下来 RxData 与 TxData 完全相同。
+//  这样不依赖主机拉高 SCK 后具体延时多久, 降低了高速 SCK 下的采样竞争风险。
 //
 //  一帧收完后: data_out 给出收到的字节, data_valid 打一个 clk 的脉冲,
 //  交给 cmd_con 做命令解码 (代替原来的 4 个按键)。
@@ -105,25 +104,8 @@ always @(posedge clk or negedge rst_n)
 
 //发送部分 (回环)
 //----------------------------------------------------------------------------------------
-//MISO 在 SCK 上升沿直接回显刚采到的这一位。
-//主机拉高 SCK 后要过几十~几百 ns 才去读 MISO (软件 SPI 的几条指令),
-//而这里从 SCK 上升沿到 MISO 稳定只需要 ~20ns (3 级同步 + 1 级寄存器),
-//所以主机读到的一定是它刚发出去的那一位。
-reg miso_r;
-
-always @(posedge clk or negedge rst_n)
-	begin
-		if(!rst_n)
-			begin
-				miso_r <= 1'b0;
-			end
-		else if(NSS_active && SCK_rising)
-			begin
-				miso_r <= MOSI_data;
-			end
-	end
-
-assign MISO = miso_r;
+//MISO 在片选无效时保持低电平, 有效时稳定输出当前 MOSI 位。
+assign MISO = NSS_active ? MOSI_data : 1'b0;
 //----------------------------------------------------------------------------------------
 
 endmodule

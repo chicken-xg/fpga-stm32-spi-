@@ -10,6 +10,7 @@
 //     0100 (8'h04)  频率计使能 开/关 (同原 key4, 上电默认开)
 //     0101 (8'h05)  频率 +1kHz 固定细调  (新增定义)
 //     0110 (8'h06)  频率 -1kHz 固定细调  (新增定义)
+//     0111（8'h07） 扫频步进1kHz/s
 //     1000 (8'h08)  软复位: 频率回 1kHz, 波形回正弦, 使能开, 相位累加器清零
 //     其它          忽略, 保持当前状态
 //
@@ -21,12 +22,21 @@
 //         否则回卷到 1kHz
 //     减: >10MHz 减 1MHz; >100kHz 减 100kHz; >10kHz 减 10kHz; >1kHz 减 1kHz;
 //         否则保持 1kHz
+//
+//  扫频:
+//     启动时从 1kHz 开始, 每 1s 增加 1kHz, 到 100MHz 后回到 1kHz。
+//     停止时保持当前频率。手动频率命令和软复位会停止扫频;
+//     换波形和频率计开关命令不会中断扫频。
 //============================================================================
-module cmd_con(
+module cmd_con #(
+	parameter [31:0] KEY_DEBOUNCE_CYCLES = 32'd3_300_000,	//165MHz 下约 20ms
+	parameter [31:0] SWEEP_STEP_CYCLES   = 32'd165_000_000	//165MHz 下 1s
+)(
 	input  wire			clk		,	//165MHz
 	input  wire			rst_n	,	//复位, 低有效
 	input  wire	[7:0]	cmd		,	//本帧收到的命令字节
 	input  wire			cmd_valid,	//命令有效脉冲 (1 个 clk 宽)
+
 	output reg	[1:0]	sel_wave,	//波形选择: 00 正弦 / 01 三角 / 10 方波
 	output reg	[31:0]	fre_k	,	//频率字
 	output reg			meas_en	,	//频率计使能
@@ -40,6 +50,11 @@ localparam [31:0] FR_100K = 32'd2603100		;	//100kHz  (阈值)
 localparam [31:0] FR_1M   = 32'd26031000	;	//1MHz    (阈值)
 localparam [31:0] FR_10M  = 32'd260310000	;	//10MHz   (阈值)
 localparam [31:0] FR_100M = 32'd2603100000	;	//100MHz  (上限)
+
+
+//扫频状态
+reg			sweep_en;
+reg [31:0]	sweep_cnt;
 
 //频率加一档 (与原 key_con 中 key1 分支一致)
 function [31:0] freq_up;
@@ -65,6 +80,12 @@ function [31:0] freq_dn;
 	end
 endfunction
 
+//这些命令会切换到手动频率控制, 因此需要停止扫频
+wire cmd_stops_sweep = cmd_valid &&
+                       ((cmd == 8'h01) || (cmd == 8'h03) ||
+                        (cmd == 8'h05) || (cmd == 8'h06) ||
+                        (cmd == 8'h08));
+
 //命令解码 ----------------------------------------------------------------
 always @(posedge clk or negedge rst_n)
 	begin
@@ -74,30 +95,81 @@ always @(posedge clk or negedge rst_n)
 				fre_k     <= FR_1K		;	//1kHz
 				meas_en   <= 1'b1		;	//频率计默认开启
 				phase_rst <= 1'b0		;
+				sweep_en  <= 1'b0		;	//默认关闭扫频
+				sweep_cnt <= 32'd0		;
 			end
 		else
 			begin
 				phase_rst <= 1'b0;			//默认只打一拍
+
+				//0111 每按一次切换扫频; 启动时从 1kHz 重新开始
+
 				if(cmd_valid)
 					begin
 						case(cmd)
-							8'h01: fre_k     <= freq_up(fre_k)				;	//0001 频率+1档
-							8'h03: fre_k     <= freq_dn(fre_k)				;	//0011 频率-1档
-							8'h05: fre_k     <= (fre_k + FR_1K > FR_100M) ? FR_1K
-							                                              : fre_k + FR_1K;	//0101 +1kHz
-							8'h06: fre_k     <= (fre_k > FR_1K) ? fre_k - FR_1K
-							                                    : FR_1K		;	//0110 -1kHz
+						    //0001 频率+1档
+							8'h01: begin
+							       sweep_en  <= 1'b0;
+							       sweep_cnt <= 32'd0;
+							       fre_k     <= freq_up(fre_k);
+						       end	
+						    //0011 频率-1档   							
+							8'h03: begin          	
+							       sweep_en  <= 1'b0;
+							       sweep_cnt <= 32'd0;
+							       fre_k     <= freq_dn(fre_k);
+						              end								
+						    //0101 +1kHz          
+							8'h05: begin
+							       sweep_en  <= 1'b0;
+							       sweep_cnt <= 32'd0;
+							       fre_k     <= (fre_k + FR_1K > FR_100M) ? FR_1K
+							                                             : fre_k + FR_1K;
+						       end								
+						    //0110 -1kHz   
+							8'h06: begin
+							       sweep_en  <= 1'b0;
+							       sweep_cnt <= 32'd0;
+							       fre_k     <= (fre_k > FR_1K) ? fre_k - FR_1K
+							                                   : FR_1K;
+						       end								
+						    //0111 扫频步进1kHz/s   
+						    8'h07:begin
+						          	 sweep_en  <= 1'b1;
+								     sweep_cnt <= 32'd0;
+								     fre_k     <= FR_1K;
+						       end
+						    //0010 换波形   
 							8'h02: sel_wave  <= (sel_wave == 2'b10) ? 2'b00
-							                                        : sel_wave + 2'b01;	//0010 换波形
-							8'h04: meas_en   <= ~meas_en						;	//0100 使能开关
-							8'h08: begin										//1000 软复位
+							                                        : sel_wave + 2'b01;	
+							//0100 使能开关                                        
+							8'h04: meas_en   <= ~meas_en						;
+							//1000 软复位	
+							8'h08: begin										
 								       sel_wave  <= 2'b00;
 								       fre_k     <= FR_1K;
 								       meas_en   <= 1'b1;
+								       sweep_en  <= 1'b0;
+								       sweep_cnt <= 32'd0;
 								       phase_rst <= 1'b1;
 							       end
 							default: ;											//其它码忽略
 						endcase
+					end
+
+				//始终保持 1kHz 固定步进; 到顶后回卷到 1kHz
+				if(sweep_en && !cmd_stops_sweep ) 
+					begin
+						if(sweep_cnt >= (SWEEP_STEP_CYCLES - 1'b1))
+							begin
+								sweep_cnt <= 32'd0;
+								if(fre_k >= FR_100M)
+									fre_k <= FR_1K;
+								else
+									fre_k <= fre_k + FR_1K;
+							end
+						else
+							sweep_cnt <= sweep_cnt + 1'b1;
 					end
 			end
 	end

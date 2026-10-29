@@ -1,11 +1,11 @@
 // ²¨ĞÎÑ¡Ôñ
 module sel_wave(
-	input 	wire					clk		,
-	input 	wire					rst_n	,
+	input 	wire			clk		,
+	input 	wire			rst_n	,
 	input 	wire	[1:0] 	sel		,
-	input 	wire	[13:0] 	da_ina,
-	input 	wire	[13:0] 	da_inb,
-	input 	wire	[13:0] 	da_inc,
+	input 	wire	[13:0] 	da_ina  ,
+	input 	wire	[13:0] 	da_inb  ,
+	input 	wire	[13:0] 	da_inc  ,
 	output 	wire	[13:0] 	da_out
 );
 

@@ -26,6 +26,7 @@ module tb_top_spi;
 	reg			SCK   = 1'b0;
 	reg			MOSI  = 1'b0;
 	reg			NSS   = 1'b1;
+	reg			KEY4  = 1'b1;		//扫频按键, 低有效
 	reg			comparator_out = 1'b0;
 	wire			MISO;
 	wire	[3:0]	led;
@@ -37,7 +38,12 @@ module tb_top_spi;
 	wire	[13:0]	DAC_DATA;
 	wire				LED;
 
-	DAC904_TOP dut (
+	//缩短消抖和扫频定时, 让顶层集成仿真在可接受时间内完成;
+	//实际综合使用 DAC904_TOP 的默认参数 (20ms / 1s)。
+	DAC904_TOP #(
+		.KEY_DEBOUNCE_CYCLES(32'd4),
+		.SWEEP_STEP_CYCLES  (32'd1024)
+	) dut (
 		.sys_clk_p		(sys_clk_p),
 		.sys_clk_n		(sys_clk_n),
 		.SYS_RST			(SYS_RST),
@@ -45,6 +51,7 @@ module tb_top_spi;
 		.MOSI				(MOSI),
 		.NSS				(NSS),
 		.MISO				(MISO),
+		.KEY4				(KEY4),
 		.led				(led),
 		.PD				(PD),
 		.DAC_CLK			(DAC_CLK),
@@ -178,6 +185,7 @@ module tb_top_spi;
 	//--------------------------------------------------------------------
 	integer		errors = 0;
 	integer		p, ns, md, nd, mn, mx;
+	integer		sweep_f_before, sweep_f_after;
 	reg	[7:0]	rx;
 	reg	[7:0]	rx2;
 
@@ -314,6 +322,65 @@ module tb_top_spi;
 				end
 			else
 				$display("  [ OK ] #18 顶层 MISO 回环正常 (STM32 会显示通信成功)");
+
+			//---- 9. KEY4 扫频启动、停止保持和再次启动 ----
+			$display("-- KEY4 扫频顶层集成检查 --");
+			stm32_xfer(8'h08, 300, rx);
+			#2000;
+
+			KEY4 = 1'b0;
+			#1000;
+			KEY4 = 1'b1;
+			#1000;
+			sweep_f_before = dut.fre_k;
+			if(sweep_f_before !== 26031)
+				begin
+					errors = errors + 1;
+					$display("  [FAIL] #19 KEY4 启动后 fre_k=%0d, 应为 26031", sweep_f_before);
+				end
+			else
+				$display("  [ OK ] #19 KEY4 启动后从 1kHz 扫频");
+
+			#7000;
+			sweep_f_after = dut.fre_k;
+			if((sweep_f_after <= sweep_f_before) ||
+			   (((sweep_f_after - sweep_f_before) % 26031) != 0))
+				begin
+					errors = errors + 1;
+					$display("  [FAIL] #20 扫频未按 1kHz 递增: %0d -> %0d",
+					         sweep_f_before, sweep_f_after);
+				end
+			else
+				$display("  [ OK ] #20 扫频按 1kHz 递增: %0d -> %0d",
+				         sweep_f_before, sweep_f_after);
+
+			KEY4 = 1'b0;
+			#1000;
+			KEY4 = 1'b1;
+			#1000;
+			sweep_f_before = dut.fre_k;
+			#15000;
+			sweep_f_after = dut.fre_k;
+			if(sweep_f_after !== sweep_f_before)
+				begin
+					errors = errors + 1;
+					$display("  [FAIL] #21 KEY4 停止后频率仍在变化: %0d -> %0d",
+					         sweep_f_before, sweep_f_after);
+				end
+			else
+				$display("  [ OK ] #21 KEY4 停止后保持 fre_k=%0d", sweep_f_after);
+
+			KEY4 = 1'b0;
+			#1000;
+			KEY4 = 1'b1;
+			#1000;
+			if(dut.fre_k !== 26031)
+				begin
+					errors = errors + 1;
+					$display("  [FAIL] #22 再次启动未回到 1kHz: fre_k=%0d", dut.fre_k);
+				end
+			else
+				$display("  [ OK ] #22 再次启动回到 1kHz");
 
 			$display("");
 			$display("==== 结果: 失败项 %0d ====", errors);

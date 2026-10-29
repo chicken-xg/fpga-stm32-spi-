@@ -1,261 +1,370 @@
 //============================================================================
-//  Module : tb_spi_cmd  --  spi 从机 + cmd_con 命令解码的测试平台
+//  Module : tb_spi_cmd  --  SPI 从机 + 命令解码 + 扫频控制仿真
 //
-//  主机模型就是 STM32 端 MYSPI.c 里 SoftSPI_ReadWriteByte() 的逐条翻译:
+//  覆盖内容:
+//    1) MISO 片选空闲为低, 多数据/多 SCK 时序位回环
+//    2) 原有 SPI 命令、非法命令和软复位
+//    3) KEY4 短按不触发、有效按下切换扫频
+//    4) 1kHz 固定步进、停止保持、再次启动从 1kHz 开始
+//    5) 手动频率命令停止扫频, 100MHz 到 1kHz 的完整回卷
 //
-//      NSS = 0
-//      for(i=0;i<8;i++) {
-//          MOSI = (tx & 0x80);  tx <<= 1;      // 1) SCK 低时写 MOSI
-//          SCK  = 1;                            // 2) 拉高 SCK
-//          #(SCK 高电平保持时间)                 // 3) 软件 SPI 的实际耗时
-//          rx = (rx<<1) | MISO;                 // 4) 在 SCK 高时读 MISO
-//          SCK  = 0;                            // 5) 拉低 SCK
-//      }
-//      NSS = 1
-//
-//  检查项:
-//   1) 位回环: 4 个命令码 x 3 档 SCK 高电平时间 = 12 帧, rx 必须等于 tx
-//      (这正是 STM32 main.c 里 g_rx==g_tx 的判据)
-//   2) 命令解码: 0001/0010/0011/0100/0101/0110/1000 的动作与指令表一致,
-//      非法码不改变状态, 1000 会打出 phase_rst 脉冲
-//   3) 频率档位回卷: 连发 200 次 0001 后 fre_k 仍然合法且发生过回卷
-//
-//  注: 本测试平台只跑 spi + cmd_con, 不例化 PLL/ROM; 完整顶层见 tb_top_spi.v。
+//  为缩短仿真时间, 主实例把 20ms/1s 定时参数缩成 16/256 个时钟;
+//  回卷实例进一步缩成 1/1。顶层默认参数仍对应实际硬件。
 //============================================================================
 `timescale 1ns / 1ps
 
 module tb_spi_cmd;
 
-	//---- 165MHz 时钟 (周期 6.0606ns) ----
+	localparam [31:0] FR_1K   = 32'd26031;
+	localparam [31:0] FR_100M = 32'd2603100000;
+	localparam integer TEST_DEBOUNCE = 16;
+	localparam integer TEST_STEP     = 256;
+
+	//165MHz 系统时钟
 	reg clk = 1'b0;
 	always #3.0303 clk = ~clk;
 
-	//---- 复位 / STM32 侧信号 ----
+	//STM32 软件 SPI 信号
 	reg			rst_n = 1'b0;
 	reg			SCK   = 1'b0;
 	reg			MOSI  = 1'b0;
 	reg			NSS   = 1'b1;
-	wire			MISO;
+	reg			KEY4  = 1'b1;
+	wire		MISO;
 
-	//---- 被测设计 ----
-	wire	[7:0]		cmd;
-	wire				cmd_valid;
-	wire	[1:0]		sel_wave;
-	wire	[31:0]		fre_k;
-	wire				meas_en;
-	wire				phase_rst;
+	wire [7:0]	cmd;
+	wire		cmd_valid;
+	wire [1:0]	sel_wave;
+	wire [31:0]	fre_k;
+	wire		meas_en;
+	wire		phase_rst;
 
-	spi u_spi (
-		.clk			(clk),
+	spi u_spi(
+		.clk		(clk),
 		.rst_n		(rst_n),
-		.SCK			(SCK),
-		.MOSI			(MOSI),
-		.NSS			(NSS),
-		.MISO			(MISO),
+		.SCK		(SCK),
+		.MOSI		(MOSI),
+		.NSS		(NSS),
+		.MISO		(MISO),
 		.data_out	(cmd),
 		.data_valid	(cmd_valid)
 	);
 
-	cmd_con u_cmd_con (
-		.clk			(clk),
+	cmd_con #(
+		.KEY_DEBOUNCE_CYCLES(TEST_DEBOUNCE),
+		.SWEEP_STEP_CYCLES  (TEST_STEP)
+	) u_cmd_con(
+		.clk		(clk),
 		.rst_n		(rst_n),
-		.cmd			(cmd),
+		.cmd		(cmd),
 		.cmd_valid	(cmd_valid),
+		.KEY4		(KEY4),
 		.sel_wave	(sel_wave),
 		.fre_k		(fre_k),
-		.meas_en		(meas_en),
+		.meas_en	(meas_en),
 		.phase_rst	(phase_rst)
 	);
 
-	//---- 监视器: 软复位脉冲 / 频率回卷 ----
-	reg			prst_seen = 1'b0;
-	reg	[31:0]	fre_prev  = 32'd0;
+	//独立的快速回卷实例, 每拍增加一次 1kHz
+	reg			wrap_key = 1'b1;
+	wire [31:0]	wrap_fre;
+	reg [31:0]	wrap_prev = 32'd0;
 	reg			wrap_seen = 1'b0;
+	reg [31:0]	wrap_value = 32'd0;
+	reg			wrap_step_bad = 1'b0;
+
+	cmd_con #(
+		.KEY_DEBOUNCE_CYCLES(1),
+		.SWEEP_STEP_CYCLES  (1)
+	) u_wrap_cmd_con(
+		.clk		(clk),
+		.rst_n		(rst_n),
+		.cmd		(8'h00),
+		.cmd_valid	(1'b0),
+		.KEY4		(wrap_key),
+		.sel_wave	(),
+		.fre_k		(wrap_fre),
+		.meas_en	(),
+		.phase_rst	()
+	);
 
 	always @(posedge clk)
 		begin
-			if (phase_rst) prst_seen <= 1'b1;
-			if (fre_k < fre_prev) wrap_seen <= 1'b1;
-			fre_prev <= fre_k;
+			if(wrap_fre > wrap_prev)
+				begin
+					if((wrap_fre - wrap_prev) != FR_1K)
+						wrap_step_bad <= 1'b1;
+				end
+			else if(wrap_fre < wrap_prev)
+				begin
+					if(wrap_fre == FR_1K)
+						begin
+							wrap_seen <= 1'b1;
+							wrap_value <= wrap_fre;
+						end
+					else
+						wrap_step_bad <= 1'b1;
+				end
+			wrap_prev <= wrap_fre;
 		end
 
-	//---- 记分板 ----
-	integer		errors    = 0;
-	integer		xfers     = 0;
-	integer		xfers_ok  = 0;
-	reg	[7:0]		rx;
+	reg			prst_seen = 1'b0;
+	always @(posedge clk)
+		if(phase_rst)
+			prst_seen <= 1'b1;
 
-	//--------------------------------------------------------------------
-	// STM32 软件 SPI 主机行为模型 (SoftSPI_ReadWriteByte)
-	//--------------------------------------------------------------------
+	integer errors = 0;
+	integer xfers = 0;
+	integer xfers_ok = 0;
+	reg [7:0] rx;
+	reg [31:0] f_before;
+	integer k;
+	integer h;
+	integer timeout;
+	integer holds [0:3];
+
 	task stm32_xfer;
-		input	[7:0]		tx;
-		input	integer		t_hold;
-		output	[7:0]		rxo;
-		integer				i;
-		reg		[7:0]		t;
-		reg		[7:0]		r;
+		input [7:0] tx;
+		input integer t_hold;
+		output [7:0] rxo;
+		integer i;
+		reg [7:0] t;
+		reg [7:0] r;
 		begin
 			t = tx;
 			r = 8'h00;
-
-			NSS = 1'b0;			//SPI_CS_L()
-			#200;				//函数调用开销
+			NSS = 1'b0;
+			#200;
 
 			for(i = 0; i < 8; i = i + 1)
 				begin
-					MOSI = t[7];			//1) 先写 MOSI
-					t    = {t[6:0], 1'b0};	//   TxData <<= 1
-					#200;					//   MOSI 建立时间
-
-					SCK = 1'b1;				//2) 拉高 SCK
-					#(t_hold);				//3) 软件 SPI 在这里去读 MISO
-					r = {r[6:0], MISO};		//4) 采样 MISO
-					SCK = 1'b0;				//5) 拉低 SCK
-					#200;					//   下一位 MOSI 之前的间隔
+					MOSI = t[7];
+					t = {t[6:0], 1'b0};
+					#200;
+					SCK = 1'b1;
+					#(t_hold);
+					r = {r[6:0], MISO};
+					SCK = 1'b0;
+					#200;
 				end
 
-			NSS = 1'b1;			//SPI_CS_H()
-			#500;				//帧间隔
+			NSS = 1'b1;
+			#500;
 			rxo = r;
 		end
 	endtask
 
-	//--------------------------------------------------------------------
-	// 状态检查: 频率字 / 波形选择 / 频率计使能
-	//--------------------------------------------------------------------
 	task chk;
-		input	[7:0]		c;		//刚发的命令码
-		input	[31:0]	ef;		//期望 fre_k
-		input	[1:0]		es;		//期望 sel_wave
-		input				ee;		//期望 meas_en
+		input [7:0] c;
+		input [31:0] ef;
+		input [1:0] es;
+		input ee;
 		begin
-			if ((fre_k !== ef) || (sel_wave !== es) || (meas_en !== ee))
+			if((fre_k !== ef) || (sel_wave !== es) || (meas_en !== ee))
 				begin
 					errors = errors + 1;
-					$display("  [FAIL] cmd=%04b : fre_k=%0d (exp %0d) sel=%b (exp %b) meas_en=%b (exp %b)", c, fre_k, ef, sel_wave, es, meas_en, ee);
+					$display("  [FAIL] cmd=%08b fre_k=%0d(exp %0d) sel=%b(exp %b) meas=%b(exp %b)",
+					         c, fre_k, ef, sel_wave, es, meas_en, ee);
 				end
 			else
-				$display("  [ OK ] cmd=%04b : fre_k=%0d  sel=%b  meas_en=%b", c, fre_k, sel_wave, meas_en);
+				$display("  [ OK ] cmd=%08b fre_k=%0d sel=%b meas=%b",
+				         c, fre_k, sel_wave, meas_en);
 		end
 	endtask
 
-	//--------------------------------------------------------------------
-	// 测试主体
-	//--------------------------------------------------------------------
-	integer		k;
-	integer		h;
-	integer		holds [0:2];
+	task key4_press;
+		begin
+			KEY4 = 1'b0;
+			repeat(TEST_DEBOUNCE + 4) @(posedge clk);
+			KEY4 = 1'b1;
+			repeat(TEST_DEBOUNCE + 4) @(posedge clk);
+		end
+	endtask
 
 	initial
 		begin
-			holds[0] = 100;		//SCK 高电平 100ns
-			holds[1] = 300;		//SCK 高电平 300ns
-			holds[2] = 1000;	//SCK 高电平 1us
+			holds[0] = 0;
+			holds[1] = 100;
+			holds[2] = 300;
+			holds[3] = 1000;
 
 			$display("");
-			$display("==== 仿真 A: SPI 位回环 + 命令解码 (spi + cmd_con, clk=165MHz) ====");
-
+			$display("==== SPI + 命令 + 扫频单元仿真 ====");
 			#200 rst_n = 1'b1;
 			#200;
 
-			//---- 1. 复位后的默认状态 ----
-			$display("-- 1. 复位默认值 (1kHz / 正弦 / 使能开) --");
-			chk(8'h00, 32'd26031, 2'b00, 1'b1);
-
-			//---- 2. 位回环: 4 码 x 3 档 SCK 高电平 ----
-			$display("-- 2. 位回环 (rx 必须等于 tx) --");
-			for (h = 0; h < 3; h = h + 1)
+			$display("-- 1. 复位默认值和 MISO 空闲电平 --");
+			chk(8'h00, FR_1K, 2'b00, 1'b1);
+			if(MISO !== 1'b0)
 				begin
-					for (k = 1; k <= 4; k = k + 1)
+					errors = errors + 1;
+					$display("  [FAIL] NSS 空闲时 MISO=%b, 应为 0", MISO);
+				end
+			else
+				$display("  [ OK ] NSS 空闲时 MISO=0");
+
+			$display("-- 2. 多种数据和 SCK 时序的位回环 --");
+			for(h = 0; h < 4; h = h + 1)
+				begin
+					for(k = 0; k < 16; k = k + 1)
 						begin
 							stm32_xfer(k[7:0], holds[h], rx);
 							xfers = xfers + 1;
-							if (rx !== k[7:0])
+							if(rx !== k[7:0])
 								begin
 									errors = errors + 1;
-									$display("  [FAIL] SCK_hold=%0dns tx=%08b rx=%08b (STM32 会判通信失败)", holds[h], k[7:0], rx);
+									$display("  [FAIL] SCK_hold=%0dns tx=%08b rx=%08b", holds[h], k[7:0], rx);
 								end
 							else
-								begin
-									xfers_ok = xfers_ok + 1;
-									$display("  [ OK ] SCK_hold=%0dns tx=%08b rx=%08b led=%b", holds[h], k[7:0], rx, {meas_en, (sel_wave==2'b10), (sel_wave==2'b01), (sel_wave==2'b00)});
-								end
+								xfers_ok = xfers_ok + 1;
 						end
+					stm32_xfer(8'hFF, holds[h], rx);
+					xfers = xfers + 1;
+					if(rx !== 8'hFF)
+						begin
+							errors = errors + 1;
+							$display("  [FAIL] SCK_hold=%0dns tx=11111111 rx=%08b", holds[h], rx);
+						end
+					else
+						xfers_ok = xfers_ok + 1;
 				end
 			$display("  -> 位回环 %0d/%0d", xfers_ok, xfers);
-
-			//---- 3. 1000 软复位 ----
-			$display("-- 3. 1000 软复位 --");
-			prst_seen = 1'b0;
-			stm32_xfer(8'h08, 300, rx);
-			chk(8'h08, 32'd26031, 2'b00, 1'b1);
-			if (prst_seen !== 1'b1)
+			if(NSS)
+				#100;
+			if(MISO !== 1'b0)
 				begin
 					errors = errors + 1;
-					$display("  [FAIL] 1000 : phase_rst 脉冲没有出现");
+					$display("  [FAIL] 帧结束后 MISO 未回到 0");
+				end
+
+			$display("-- 3. 软复位和短按滤除 --");
+			stm32_xfer(8'h08, 300, rx);
+			chk(8'h08, FR_1K, 2'b00, 1'b1);
+			if(!prst_seen)
+				begin
+					errors = errors + 1;
+					$display("  [FAIL] 软复位 phase_rst 未出现");
 				end
 			else
-				$display("  [ OK ] 1000 : phase_rst 脉冲已出现 (相位累加器被清零)");
+				$display("  [ OK ] 软复位 phase_rst 已出现");
 
-			//---- 4. 命令解码 ----
-			$display("-- 4. 命令解码 --");
-			stm32_xfer(8'h01, 300, rx); chk(8'h01, 32'd52062, 2'b00, 1'b1);
-			stm32_xfer(8'h01, 300, rx); chk(8'h01, 32'd78093, 2'b00, 1'b1);
-			stm32_xfer(8'h01, 300, rx); chk(8'h01, 32'd104124, 2'b00, 1'b1);
-			stm32_xfer(8'h03, 300, rx); chk(8'h03, 32'd78093, 2'b00, 1'b1);
-			stm32_xfer(8'h02, 300, rx); chk(8'h02, 32'd78093, 2'b01, 1'b1);
-			stm32_xfer(8'h02, 300, rx); chk(8'h02, 32'd78093, 2'b10, 1'b1);
-			stm32_xfer(8'h02, 300, rx); chk(8'h02, 32'd78093, 2'b00, 1'b1);
-			stm32_xfer(8'h04, 300, rx); chk(8'h04, 32'd78093, 2'b00, 1'b0);
-			stm32_xfer(8'h04, 300, rx); chk(8'h04, 32'd78093, 2'b00, 1'b1);
-			stm32_xfer(8'h05, 300, rx); chk(8'h05, 32'd104124, 2'b00, 1'b1);
-			stm32_xfer(8'h06, 300, rx); chk(8'h06, 32'd78093, 2'b00, 1'b1);
-			stm32_xfer(8'h06, 300, rx); chk(8'h06, 32'd52062, 2'b00, 1'b1);
-			stm32_xfer(8'h06, 300, rx); chk(8'h06, 32'd26031, 2'b00, 1'b1);
-			stm32_xfer(8'h06, 300, rx); chk(8'h06, 32'd26031, 2'b00, 1'b1);
+			KEY4 = 1'b0;
+			repeat(TEST_DEBOUNCE / 2) @(posedge clk);
+			KEY4 = 1'b1;
+			repeat(TEST_DEBOUNCE + 4) @(posedge clk);
+			repeat(TEST_STEP + 8) @(posedge clk);
+			chk(8'h08, FR_1K, 2'b00, 1'b1);
 
-			//---- 5. 非法码忽略 ----
-			$display("-- 5. 非法码 1111 应被忽略 --");
-			stm32_xfer(8'h0F, 300, rx);
-			if (rx !== 8'h0F)
+			$display("-- 4. KEY4 启动、1kHz 步进和停止保持 --");
+			key4_press();
+			chk(8'h08, FR_1K, 2'b00, 1'b1);
+			repeat(TEST_STEP + 4) @(posedge clk);
+			if(fre_k !== (FR_1K * 2))
 				begin
 					errors = errors + 1;
-					$display("  [FAIL] 1111 回环: rx=%08b", rx);
-				end
-			chk(8'h0F, 32'd26031, 2'b00, 1'b1);
-
-			//---- 6. 频率回卷性质 ----
-			$display("-- 6. 连发 200 次 0001 (检查跑到 100MHz 后回卷) --");
-			wrap_seen = 1'b0;
-			for (k = 0; k < 200; k = k + 1)
-				stm32_xfer(8'h01, 100, rx);
-
-			if (wrap_seen !== 1'b1)
-				begin
-					errors = errors + 1;
-					$display("  [FAIL] 200 次加档都没有回卷");
-				end
-			else if ((fre_k < 32'd26031) || (fre_k > 32'd2603100000) || ((fre_k % 32'd26031) != 32'd0))
-				begin
-					errors = errors + 1;
-					$display("  [FAIL] 回卷后 fre_k=%0d 不是合法档位", fre_k);
+					$display("  [FAIL] 第一步 fre_k=%0d, 期望 %0d", fre_k, FR_1K * 2);
 				end
 			else
-				$display("  [ OK ] 发生过回卷, 且 fre_k=%0d 仍是合法档位", fre_k);
+				$display("  [ OK ] 第一步 fre_k=%0d", fre_k);
+			repeat(TEST_STEP) @(posedge clk);
+			if(fre_k !== (FR_1K * 3))
+				begin
+					errors = errors + 1;
+					$display("  [FAIL] 第二步 fre_k=%0d, 期望 %0d", fre_k, FR_1K * 3);
+				end
+			else
+				$display("  [ OK ] 第二步 fre_k=%0d", fre_k);
 
-			//---- 7. 收尾: 1000 回默认 ----
-			$display("-- 7. 1000 收尾回默认 --");
+			key4_press();
+			f_before = fre_k;
+			repeat(TEST_STEP * 2) @(posedge clk);
+			if(fre_k !== f_before)
+				begin
+					errors = errors + 1;
+					$display("  [FAIL] 停止后频率仍变化: %0d -> %0d", f_before, fre_k);
+				end
+			else
+				$display("  [ OK ] 停止后保持 fre_k=%0d", fre_k);
+
+			key4_press();
+			if(fre_k !== FR_1K)
+				begin
+					errors = errors + 1;
+					$display("  [FAIL] 再次启动未回到 1kHz: fre_k=%0d", fre_k);
+				end
+			else
+				$display("  [ OK ] 再次启动回到 1kHz");
+
+			$display("-- 5. 波形/频率计命令不打断扫频, 频率命令停止扫频 --");
+			f_before = fre_k;
+			stm32_xfer(8'h02, 300, rx);
+			repeat(TEST_STEP + 8) @(posedge clk);
+			if((fre_k <= f_before) || (sel_wave !== 2'b01))
+				begin
+					errors = errors + 1;
+					$display("  [FAIL] 0010 后扫频/波形异常 fre=%0d sel=%b", fre_k, sel_wave);
+				end
+			else
+				$display("  [ OK ] 0010 换三角波后扫频继续 fre=%0d", fre_k);
+
+			f_before = fre_k;
+			stm32_xfer(8'h04, 300, rx);
+			repeat(TEST_STEP + 8) @(posedge clk);
+			if((fre_k <= f_before) || meas_en)
+				begin
+					errors = errors + 1;
+					$display("  [FAIL] 0100 后扫频/使能异常 fre=%0d meas=%b", fre_k, meas_en);
+				end
+			else
+				$display("  [ OK ] 0100 关闭频率计后扫频继续 fre=%0d", fre_k);
+
+			stm32_xfer(8'h05, 300, rx);
+			f_before = fre_k;
+			repeat(TEST_STEP * 2) @(posedge clk);
+			if(fre_k !== f_before)
+				begin
+					errors = errors + 1;
+					$display("  [FAIL] 0101 后扫频未停止 %0d -> %0d", f_before, fre_k);
+				end
+			else
+				$display("  [ OK ] 0101 固定 +1kHz 后停止扫频, fre_k=%0d", fre_k);
+
+			$display("-- 6. 原有命令和非法码 --");
 			stm32_xfer(8'h08, 300, rx);
-			chk(8'h08, 32'd26031, 2'b00, 1'b1);
+			stm32_xfer(8'h01, 300, rx); chk(8'h01, FR_1K * 2, 2'b00, 1'b1);
+			stm32_xfer(8'h03, 300, rx); chk(8'h03, FR_1K, 2'b00, 1'b1);
+			stm32_xfer(8'h02, 300, rx); chk(8'h02, FR_1K, 2'b01, 1'b1);
+			stm32_xfer(8'h02, 300, rx); chk(8'h02, FR_1K, 2'b10, 1'b1);
+			stm32_xfer(8'h02, 300, rx); chk(8'h02, FR_1K, 2'b00, 1'b1);
+			stm32_xfer(8'h04, 300, rx); chk(8'h04, FR_1K, 2'b00, 1'b0);
+			stm32_xfer(8'h04, 300, rx); chk(8'h04, FR_1K, 2'b00, 1'b1);
+			stm32_xfer(8'h06, 300, rx); chk(8'h06, FR_1K, 2'b00, 1'b1);
+			stm32_xfer(8'h0F, 300, rx); chk(8'h0F, FR_1K, 2'b00, 1'b1);
+
+			$display("-- 7. 1kHz 到 100MHz 的完整回卷 --");
+			wrap_key = 1'b0;
+			repeat(4) @(posedge clk);
+			wrap_key = 1'b1;
+			timeout = 0;
+			while((!wrap_seen) && (timeout < 200000))
+				begin
+					@(posedge clk);
+					timeout = timeout + 1;
+				end
+			if(!wrap_seen || (wrap_value !== FR_1K) || wrap_step_bad)
+				begin
+					errors = errors + 1;
+					$display("  [FAIL] 回卷异常 seen=%b value=%0d step_bad=%b", wrap_seen, wrap_value, wrap_step_bad);
+				end
+			else
+				$display("  [ OK ] 100MHz 后回到 fre_k=%0d, 使用 %0d 个时钟", wrap_value, timeout);
 
 			$display("");
 			$display("==== 结果: 位回环 %0d/%0d, 失败项 %0d ====", xfers_ok, xfers, errors);
-			if ((errors == 0) && (xfers_ok == xfers))
+			if((errors == 0) && (xfers_ok == xfers))
 				$display("PASS: 全部通过");
 			else
 				$display("FAIL: 存在错误");
-
 			$finish;
 		end
 

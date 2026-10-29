@@ -25,6 +25,12 @@ set_property IOSTANDARD LVCMOS33 [get_ports SYS_RST]
 # 板上 RESET 键已有外部上拉, 这里再打开内部弱上拉做保险
 set_property PULLUP TRUE [get_ports SYS_RST]
 
+############## 扫频按键 KEY4 (J17, 低有效) ##################
+# AX7A035B 扩展板 KEY4, 板上已有 3.3V 上拉, 这里再打开内部上拉做保险
+set_property PACKAGE_PIN J17 [get_ports KEY4]
+set_property IOSTANDARD LVCMOS33 [get_ports KEY4]
+set_property PULLUP TRUE [get_ports KEY4]
+
 ############## SPI 从机 (J11-3/4/5/6, 与 STM32 相连) ##################
 #   STM32: PA8=SCK  PA9=MOSI  PA10=MISO  PA11=CS(NSS)
 set_property PACKAGE_PIN G21 [get_ports SCK]
@@ -121,11 +127,12 @@ set_property PACKAGE_PIN W5 [get_ports LED]
 set_property IOSTANDARD LVCMOS15 [get_ports LED]
 
 ############## 跨时钟域处理 ##################
-# SCK / MOSI / NSS / comparator_out 相对 165MHz 是异步信号,
+# SCK / MOSI / NSS / KEY4 / comparator_out 相对 165MHz 是异步信号,
 # spi.v 内部 3 级同步器、frequency_meter.v 内部同步+去抖已经处理, 不做时序分析。
 set_false_path -from [get_ports {SCK}]
 set_false_path -from [get_ports {MOSI}]
 set_false_path -from [get_ports {NSS}]
+set_false_path -from [get_ports {KEY4}]
 set_false_path -from [get_ports {comparator_out}]
 
 ############## 频率计除法器的多周期约束 ##################

@@ -49,6 +49,7 @@
 |---|---|---|---|
 | `sys_clk_p` / `sys_clk_n` | 板载 200MHz 差分晶振 | R4 / T4 | DIFF_SSTL15 |
 | `SYS_RST`（RESET 键，低有效） | 按键 | F15 | LVCMOS33 + PULLUP |
+| `KEY4`（自动扫频开关，低有效） | 扩展板 KEY4 | J17 | LVCMOS33 + PULLUP |
 | `SCK` / `MOSI` / `NSS` / `MISO` | J11-3/4/5/6 | G21 / G22 / C22 / B22 | LVCMOS33 |
 | `comparator_out`（TLV3501 比较器） | J11-7 | F19 | LVCMOS33 |
 | `BEEP_EN`（RTL 里恒 0） | J11-9 | D20 | LVCMOS33 |
@@ -206,3 +207,76 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\encoding.ps1 -To gbk    # 
 - 回滚点：`vivado/FPGA_xc7a35t还没有spi.zip`（改动前的完整工程快照）。
 - 本次在工程目录下留下两个临时目录 `.xsim_a` / `.xsim_b`（命令行仿真用的编译产物，约 5MB），可直接删除。
 - 在 GUI 里跑仿真：`sim_1` 的顶层目前是 `tb_spi_cmd`（快）；要看完整顶层就把 sim 顶层切成 `tb_top_spi` 再 Run Simulation。
+
+## 10. 2026-10-26 扫频升级与最终下载（最新）
+
+### 10.1 KEY4 扫频行为
+
+- KEY4（J17）低有效，使用 165MHz 时钟进行 3 级同步和约 20ms 消抖。
+- 第一次按下：启动扫频并从 1kHz 重新开始。
+- 扫频步进固定为 `26031`（约 1kHz），每 `165000000` 个 165MHz 周期增加一步，即每 1s 增加约 1kHz。
+- 扫到 100MHz 后回到 1kHz 并继续循环，一轮约 27.8 小时。
+- 第二次按下：停止扫频并保持当前频率；再次按下会重新从 1kHz 开始。
+- SPI 频率增减、固定 ±1kHz 或软复位命令会停止扫频；换波形和频率计开关命令不会中断扫频。
+- DAC、ROM、波形选择和频率计功能保持不变。
+
+### 10.2 SPI 加固
+
+- 保持 STM32 端 `g_rx == g_tx` 协议，不修改 STM32 程序。
+- MISO 在片选有效时直接输出经过 3 级同步的 MOSI 位，在 SCK 上升沿前已经稳定；
+  片选无效时 MISO 为低电平。
+- 物理线序仍为 PA8→G21、PA9→G22、PA11→C22、PA10←B22，并必须共地。
+
+### 10.3 仿真结果
+
+```
+tb_spi_cmd:
+  MISO 空闲电平             OK
+  SPI 位回环                68/68
+  KEY4 短按滤除             OK
+  第一次按键从 1kHz 开始    OK
+  1kHz 固定步进            26031 -> 52062 -> 78093
+  第二次按键停止并保持      OK
+  再次按键从 1kHz 重启      OK
+  波形/频率计命令不中断扫频 OK
+  手动频率命令停止扫频      OK
+  软复位、原有命令、非法码  OK
+  100MHz 回卷到 1kHz        OK
+  结果: 失败项 0, PASS
+
+tb_top_spi:
+  PLL、DAC、三种波形、频率计、SPI 回环原有功能  OK
+  KEY4 启动/1kHz 步进/停止保持/重新启动         OK
+  结果: 22 项检查, 失败项 0, PASS
+```
+
+### 10.4 综合、实现与引脚
+
+```
+Synthesis       : 0 errors, 0 critical warnings, 92 warnings
+Implementation  : 0 errors, 0 critical warnings
+DRC             : 0 errors, 43 warnings (DSP 流水/异步复位建议, 无 I/O 错误)
+Timing          : WNS = +0.248ns, TNS = 0.000ns
+                  WHS = +0.109ns, THS = 0.000ns
+                  All user specified timing constraints are met
+Resource        : Slice LUTs 2764 (13.29%)
+                  Slice Registers 412 (0.99%)
+                  Block RAM Tile 4 (8.00%)
+                  DSP48E1 4 (4.44%)
+                  Bonded IOB 31 (12.40%, 31/31 FIXED)
+KEY4            : J17, LVCMOS33, INPUT, PULLUP, FIXED
+```
+
+### 10.5 最终比特流与下载状态
+
+```
+Bitstream : FPGA_xc7a35t.runs/impl_1/DAC904_TOP.bit
+Size      : 2192118 bytes
+SHA256    : 78AD1390EF4397C1E0791565E840D97EA1265C823E78077B8F9F8C2F6F30F0B8
+Download  : JTAG SRAM 下载成功, 未烧写 QSPI Flash
+DONE      : 1
+EOS       : 1
+```
+
+下载后刷新 HW Device，设备仍保持已编程状态。板上最终确认时，上电默认应为 1kHz 正弦波；
+按下 KEY4 后观察频率逐步增加，再按一次应保持当前频率。

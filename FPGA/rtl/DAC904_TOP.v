@@ -1,4 +1,8 @@
-module DAC904_TOP(
+module DAC904_TOP #(
+	//默认值对应实际硬件: 20ms 按键消抖, 1s 扫频步进
+	parameter [31:0] KEY_DEBOUNCE_CYCLES = 32'd3_300_000,
+	parameter [31:0] SWEEP_STEP_CYCLES   = 32'd165_000_000
+)(
 	//---- 板载 200MHz 差分时钟 (AX7A035B: SYS_CLK_P=R4 / SYS_CLK_N=T4) ----
 	//     内部 4 分频得到 50MHz, 再送给 PLL_CLK 产生 165MHz
 	input  wire 			 sys_clk_p	,	//200MHz 差分时钟 P
@@ -10,13 +14,13 @@ module DAC904_TOP(
 	input  wire				 NSS		,	//STM32 PA11 (片选, 低有效)
 	output wire				 MISO		,	//STM32 PA10 (MISO, 位回环)
 	//---- 板载 LED: 指示当前波形与频率计使能 ----
-	output wire	[3:0]	 led		,	//[0]正弦 [1]三角 [2]方波 [3]频率计使能
-	output wire				 PD	   ,
+	output wire	[3:0]	     led		,	//[0]正弦 [1]三角 [2]方波 [3]频率计使能
+	output wire				 PD	        ,
 	output wire				 DAC_CLK	,
-	output wire           BEEP_EN ,
-	input  wire           comparator_out,
-	output wire	[13:0]    DAC_DATA,
-	output wire           LED 
+	output wire              BEEP_EN    ,
+	input  wire              comparator_out,
+	output wire	[13:0]       DAC_DATA   ,
+	output wire              LED 
 	
 );
 
@@ -30,16 +34,16 @@ wire 	[11:0] addr			;
 wire 	[13:0] wave_z		;
 wire 	[13:0] wave_s		;
 wire 	[13:0] wave_f		;
-wire	[13:0] DATA_BUF	;
-wire  [63:0] freq_prod  ;
-wire  [31:0] freq_hz    ;      // 实际频率，单位Hz
+wire	[13:0] DATA_BUF	    ;
+wire    [63:0] freq_prod    ;
+wire    [31:0] freq_hz      ;      // 实际频率，单位Hz
 
 //---- 时钟: 200MHz 差分 -> 单端 -> 4 分频 -> 50MHz ----
-wire			SYS_CLK	 ;		//50MHz, 由 200MHz 分频得到 (原名是顶层 50MHz 输入)
+wire			SYS_CLK	    ;		//50MHz, 由 200MHz 分频得到 (原名是顶层 50MHz 输入)
 wire			clk_200_ibuf;	//IBUFDS 出来的单端 200MHz
-wire			clk_200	 ;		//BUFG 之后的 200MHz
-wire			clk_50_raw ;	//分频出来的 50MHz (还没上 BUFG)
-reg	[1:0]	clk_div = 2'b00;	//2 位计数器, 最高位正好是 200/4=50MHz, 占空比 50%
+wire			clk_200	    ;		//BUFG 之后的 200MHz
+wire			clk_50_raw  ;	//分频出来的 50MHz (还没上 BUFG)
+reg	[1:0]	clk_div = 2'b00 ;	//2 位计数器, 最高位正好是 200/4=50MHz, 占空比 50%
 
 // 频率计实例化
 wire [31:0] measured_freq;   // 测量结果
@@ -78,7 +82,7 @@ IBUFDS u_sys_clk_ibufds(
 
 BUFG u_sys_clk_bufg(
 	.I		(clk_200_ibuf	),
-	.O		(clk_200			)
+	.O		(clk_200		)
 );
 
 always @(posedge clk_200)
@@ -90,67 +94,70 @@ assign clk_50_raw = clk_div[1];		//200MHz / 4 = 50MHz
 
 BUFG u_clk50_bufg(
 	.I		(clk_50_raw		),
-	.O		(SYS_CLK			)
+	.O		(SYS_CLK		)
 );
 
 //锁相环模块 (50MHz -> 165MHz, 与原来完全一致)
 PLL_CLK u_PLL_CLK(
 	 .areset (!SYS_RST), 
-	 .inclk0	(SYS_CLK	),
-	 .c0			(CLK_165M	)
+	 .inclk0 (SYS_CLK ),
+	 .c0	 (CLK_165M)
 );
 
 // 正弦波数据，ROM表
 ROM_Sin u_ROM_Sin(
-	.address(addr			),
+	.address(addr		),
 	.clock	(CLK_165M	),
-	.q			(wave_z		)
+	.q		(wave_z		)
 );
 
 // 三角波数据，ROM表
 ROM_Tri ROM_Tri(
-	.address(addr			),
+	.address(addr		),
 	.clock	(CLK_165M	),
-	.q			(wave_s		)
+	.q		(wave_s		)
 );
 
 //地址累加器
 add_32bit u_add_32bit(
 	.clk	(CLK_165M	),
 	.rst	(rst_add_n	),
-	.fr_k (fre_k		),
-	.adder(addr			)
+	.fr_k   (fre_k		),
+	.adder  (addr		)
 );
 
 //SPI 从机: 收 STM32 发来的命令字节, 并把同一位回环给 MISO (握手用)
 spi u_spi(
 	.clk			(CLK_165M	),
-	.rst_n		(SYS_RST	),
-	.SCK			(SCK			),
-	.MOSI			(MOSI			),
-	.NSS			(NSS			),
-	.MISO			(MISO			),
-	.data_out	(spi_data	),
-	.data_valid	(spi_valid	)
+	.rst_n		    (SYS_RST	),
+	.SCK			(SCK		),
+	.MOSI			(MOSI		),
+	.NSS			(NSS		),
+	.MISO			(MISO		),
+	.data_out	    (spi_data	),
+	.data_valid	    (spi_valid	)
 );
 
 //命令解码模块 (代替原来的按键控制)
-cmd_con u_cmd_con(
-	.clk			(CLK_165M	),
+cmd_con #(
+	.KEY_DEBOUNCE_CYCLES(KEY_DEBOUNCE_CYCLES),
+	.SWEEP_STEP_CYCLES  (SWEEP_STEP_CYCLES  )
+) u_cmd_con(
+	.clk		(CLK_165M	),
 	.rst_n		(SYS_RST	),
-	.cmd			(spi_data	),
+	.cmd		(spi_data	),
 	.cmd_valid	(spi_valid	),
-	.sel_wave	(sel			),
+	.sel_wave	(sel		),
 	.fre_k		(fre_k		),
-	.meas_en		(meas_en		),
+	.meas_en	(meas_en	),
 	.phase_rst	(phase_rst	)
 );
 
 //波形输出选择模块
 sel_wave u_sel_wave(
-	.clk		(CLK_165M	),
+	.clk	(CLK_165M	),
 	.rst_n	(SYS_RST	),
-	.sel		(sel			),
+	.sel	(sel		),
 	.da_ina (wave_z		),
 	.da_inb (wave_s		),
 	.da_inc (wave_f		),
